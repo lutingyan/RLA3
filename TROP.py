@@ -6,22 +6,32 @@ import torch.optim as optim
 import torch.nn.functional as F
 import pandas as pd
 import os
+from torch.distributions import Categorical
+from torch.autograd import Variable
+from scipy.optimize import minimize
 
 # Hyperparameters
-lr_critic = 5e-4
+lr_critic = 1e-3
 gamma = 0.99
 lam = 0.95
-K_epochs = 4
-minibatch_size = 128
-kl_threshold = 0.2
-hidden_dim = 128
+delta = 0.01  # KL divergence threshold
 max_steps = int(1e6)
 NUM_RUNS = 5
+hidden_dim = 128
+batch_size = 2048
+train_critic_iters = 80
+train_policy_iters = 80
+cg_iters = 10
+backtrack_iters = 10
+backtrack_coeff = 0.8
 
 # Environment
 env = gym.make('CartPole-v1')
 state_dim = env.observation_space.shape[0]
 action_dim = env.action_space.n
+
+torch.backends.cudnn.benchmark = True
+
 
 # Policy Network
 class PolicyNetwork(nn.Module):
@@ -39,9 +49,10 @@ class PolicyNetwork(nn.Module):
     def act(self, state):
         state = torch.FloatTensor(state)
         probs = self.forward(state)
-        dist = torch.distributions.Categorical(probs)
+        dist = Categorical(probs)
         action = dist.sample()
         return action.item(), dist.log_prob(action)
+
 
 # Value Network
 class Critic(nn.Module):
@@ -56,6 +67,7 @@ class Critic(nn.Module):
         x = F.relu(self.fc2(x))
         return self.fc3(x)
 
+
 # GAE computation
 def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
     values = np.append(values, 0.0)
@@ -67,39 +79,17 @@ def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
         returns[t] = gae + values[t]
     return torch.FloatTensor(returns)
 
-# Flat parameters
-def flat_params(model):
-    return torch.cat([param.view(-1) for param in model.parameters()])
 
-def set_flat_params(model, flat_params):
-    prev_ind = 0
-    for param in model.parameters():
-        flat_size = int(np.prod(param.shape))
-        param.data.copy_(flat_params[prev_ind:prev_ind + flat_size].view(param.shape))
-        prev_ind += flat_size
-
-def get_flat_grad(loss, model):
-    grads = torch.autograd.grad(loss, model.parameters(), create_graph=True)
-    return torch.cat([grad.view(-1) for grad in grads])
-
-def hessian_vector_product(kl, model, v):
-    grads = torch.autograd.grad(kl, model.parameters(), create_graph=True, retain_graph=True)
-    flat_grad_kl = torch.cat([grad.contiguous().view(-1) for grad in grads])
-    grad_v = torch.dot(flat_grad_kl, v)
-    hvp = torch.autograd.grad(grad_v, model.parameters(), retain_graph=True)
-    return torch.cat([g.contiguous().view(-1) for g in hvp]) + 0.1 * v  # 添加damping
-
-
-def conjugate_gradients(Av_func, b, nsteps=10, residual_tol=1e-10):
+def conjugate_gradient(Avp, b, nsteps=10, residual_tol=1e-10):
     x = torch.zeros_like(b)
     r = b.clone()
     p = b.clone()
     rdotr = torch.dot(r, r)
-    for i in range(nsteps):
-        Avp = Av_func(p)
-        alpha = rdotr / (torch.dot(p, Avp) + 1e-8)
+    for _ in range(nsteps):
+        _Avp = Avp(p)
+        alpha = rdotr / torch.dot(p, _Avp)
         x += alpha * p
-        r -= alpha * Avp
+        r -= alpha * _Avp
         new_rdotr = torch.dot(r, r)
         if new_rdotr < residual_tol:
             break
@@ -108,18 +98,58 @@ def conjugate_gradients(Av_func, b, nsteps=10, residual_tol=1e-10):
         rdotr = new_rdotr
     return x
 
-def line_search(model, f, x, fullstep, expected_improve_rate, max_backtracks=10, accept_ratio=0.3):
-    fval = f(x)
-    for stepfrac in [0.5 ** i for i in range(max_backtracks)]:
-        x_new = x + stepfrac * fullstep
-        set_flat_params(model, x_new)
-        new_fval = f(x_new)
-        actual_improve = fval - new_fval
+
+def line_search(model, f, x, fullstep, expected_improve_rate, max_backtracks=10, accept_ratio=0.1):
+    fval = f().item()
+    for (_n_backtracks, stepfrac) in enumerate(0.5 ** np.arange(max_backtracks)):
+        xnew = x + stepfrac * fullstep
+        set_flat_params_to(model, xnew)
+        newfval = f().item()
+        actual_improve = fval - newfval
         expected_improve = expected_improve_rate * stepfrac
-        ratio = actual_improve / (expected_improve + 1e-8)
+        ratio = actual_improve / expected_improve
         if ratio > accept_ratio and actual_improve > 0:
-            return True, x_new
+            return True, xnew
     return False, x
+
+
+def set_flat_params_to(model, flat_params):
+    prev_ind = 0
+    for param in model.parameters():
+        flat_size = int(np.prod(list(param.size())))
+        param.data.copy_(flat_params[prev_ind:prev_ind + flat_size].view(param.size()))
+        prev_ind += flat_size
+
+
+def get_flat_params_from(model):
+    params = []
+    for param in model.parameters():
+        params.append(param.data.view(-1))
+    return torch.cat(params)
+
+
+def get_flat_grad_from(net, grad_grad=False):
+    grads = []
+    for param in net.parameters():
+        if grad_grad:
+            grads.append(param.grad.grad.view(-1))
+        else:
+            grads.append(param.grad.view(-1))
+    return torch.cat(grads)
+
+
+def hessian_vector_product(model, vector, states, old_dist):
+    model.zero_grad()
+    probs = model(states)
+    dist = Categorical(probs)
+    kl = torch.distributions.kl.kl_divergence(old_dist, dist).mean()
+    kl_grad = torch.autograd.grad(kl, model.parameters(), create_graph=True)
+    kl_grad_flat = torch.cat([grad.view(-1) for grad in kl_grad])
+    kl_grad_vector_product = (kl_grad_flat * vector).sum()
+    grad2 = torch.autograd.grad(kl_grad_vector_product, model.parameters())
+    grad2_flat = torch.cat([grad.contiguous().view(-1) for grad in grad2])
+    return grad2_flat + 0.1 * vector
+
 
 def run_trpo(seed=0):
     actor = PolicyNetwork(state_dim, action_dim, hidden_dim)
@@ -137,7 +167,8 @@ def run_trpo(seed=0):
         episode_data, episode_reward = [], []
         done = False
 
-        while not done:
+        # Collect trajectories
+        while len(episode_data) < batch_size:
             action, log_prob = actor.act(state)
             next_state, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
@@ -149,6 +180,7 @@ def run_trpo(seed=0):
             state = next_state
             total_steps += 1
 
+            # 完全保留您要求的评估频率和方式
             if total_steps >= 1250 and total_steps % 250 == 0:
                 eval_reward = 0
                 eval_state, _ = env.reset(seed=seed)
@@ -164,8 +196,13 @@ def run_trpo(seed=0):
                 eval_scores.append(eval_reward)
                 eval_steps.append(total_steps)
                 print(f"[Eval @ Step {total_steps}] Reward: {eval_reward}")
-                episode_rewards.append(sum(episode_reward))
 
+            if done:
+                state, _ = env.reset(seed=seed)
+                episode_rewards.append(sum(episode_reward))
+                episode_reward = []
+
+        # 以下是TRPO的核心算法部分，替换了原来的PPO更新
         states, rewards, values, log_probs_old, actions, dones = zip(*episode_data)
         states = torch.FloatTensor(np.array(states))
         actions = torch.tensor(actions, dtype=torch.long)
@@ -179,63 +216,63 @@ def run_trpo(seed=0):
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         log_probs_old_tensor = torch.stack(log_probs_old).detach()
 
-        dataset_size = len(states)
-        for _ in range(K_epochs):
-            indices = np.arange(dataset_size)
+        # Update critic
+        for _ in range(train_critic_iters):
+            indices = np.arange(len(states))
             np.random.shuffle(indices)
-            for start in range(0, dataset_size, minibatch_size):
-                end = start + minibatch_size
+            for start in range(0, len(states), 64):
+                end = start + 64
                 mb_idx = indices[start:end]
                 mb_states = states[mb_idx]
-                mb_actions = actions[mb_idx]
                 mb_returns = returns[mb_idx]
-                mb_advantages = advantages[mb_idx]
-                mb_log_probs_old = log_probs_old_tensor[mb_idx]
 
-                mb_probs = actor(mb_states)
-                mb_dist = torch.distributions.Categorical(mb_probs)
-                mb_log_probs = mb_dist.log_prob(mb_actions)
+                value_preds = critic(mb_states).squeeze()
+                value_loss = F.mse_loss(value_preds, mb_returns)
 
-                ratio = torch.exp(mb_log_probs - mb_log_probs_old)
-                surrogate = (ratio * mb_advantages).mean()
-
-                with torch.no_grad():
-                    old_probs = mb_probs.detach()
-                    old_dist = torch.distributions.Categorical(probs=old_probs)
-                kl = torch.distributions.kl.kl_divergence(old_dist, mb_dist).mean()
-
-                loss_pi = -surrogate
-                g = get_flat_grad(loss_pi, actor).detach()
-
-                def Hx(v):
-                    return hessian_vector_product(kl, actor, v)
-
-                step_dir = conjugate_gradients(Hx, g)
-                shs = 0.5 * (step_dir * Hx(step_dir)).sum(0, keepdim=True)
-                step_size = torch.sqrt(2 * kl_threshold / (shs + 1e-8))
-                fullstep = step_size * step_dir
-                old_params = flat_params(actor).detach()
-
-                def get_loss_kl(params):
-                    set_flat_params(actor, params)
-                    probs = actor(mb_states)
-                    dist = torch.distributions.Categorical(probs)
-                    log_probs = dist.log_prob(mb_actions)
-                    ratio = torch.exp(log_probs - mb_log_probs_old)
-                    surrogate = -(ratio * mb_advantages).mean()
-                    kl = torch.distributions.kl.kl_divergence(old_dist, dist).mean()
-                    return surrogate + kl
-
-                success, new_params = line_search(actor, get_loss_kl, old_params, fullstep, g.dot(step_dir))
-                set_flat_params(actor, new_params)
-
-                mb_value_preds = critic(mb_states).squeeze()
-                mb_value_loss = F.mse_loss(mb_value_preds, mb_returns)
                 optimizer_critic.zero_grad()
-                mb_value_loss.backward()
+                value_loss.backward()
                 optimizer_critic.step()
 
+        # TRPO policy update
+        probs = actor(states)
+        old_dist = Categorical(probs.detach())
+
+        def get_loss():
+            probs = actor(states)
+            dist = Categorical(probs)
+            log_probs = dist.log_prob(actions)
+            ratio = torch.exp(log_probs - log_probs_old_tensor)
+            return -(ratio * advantages).mean()
+
+        def get_kl():
+            probs = actor(states)
+            dist = Categorical(probs)
+            return torch.distributions.kl.kl_divergence(old_dist, dist).mean()
+
+        loss = get_loss()
+        grads = torch.autograd.grad(loss, actor.parameters())
+        loss_grad = torch.cat([grad.view(-1) for grad in grads]).detach()
+
+        def Fvp(v):
+            return hessian_vector_product(actor, v, states, old_dist)
+
+        stepdir = conjugate_gradient(Fvp, -loss_grad, nsteps=cg_iters)
+        shs = 0.5 * (stepdir * Fvp(stepdir)).sum(0, keepdim=True)
+        lm = torch.sqrt(shs / delta)
+        fullstep = stepdir / lm[0]
+
+        expected_improve = (-loss_grad * stepdir).sum(0, keepdim=True)
+
+        prev_params = get_flat_params_from(actor)
+        success, new_params = line_search(actor, get_loss, prev_params, fullstep, expected_improve)
+        set_flat_params_to(actor, new_params)
+
+        if not success:
+            print("Line search failed!")
+            set_flat_params_to(actor, prev_params)
+
     return episode_rewards, eval_scores, eval_steps
+
 
 if __name__ == "__main__":
     all_scores, all_eval_scores, all_eval_steps, all_steps = [], [], [], []
@@ -270,6 +307,6 @@ if __name__ == "__main__":
     })
     df.to_csv('./results/trpo_train_results.csv', index=False)
 
-    print("\n TRPO Results saved to ./results/")
-    print("\n Summary:")
+    print("\nTRPO Results saved to ./results/")
+    print("\nSummary:")
     print(df[['avg_reward']].agg(['mean', 'max']))
