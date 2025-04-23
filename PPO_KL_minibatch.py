@@ -8,6 +8,8 @@ import torch.nn.functional as F
 import pandas as pd
 import os
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 torch.backends.cudnn.benchmark = True
 
 env = gym.make('CartPole-v1')
@@ -40,7 +42,7 @@ class Actor(nn.Module):
         return F.softmax(self.fc3(x), dim=-1)
 
     def act(self, state):
-        state = torch.FloatTensor(state)
+        state = torch.FloatTensor(state).to(device)
         probs = self.forward(state)
         dist = torch.distributions.Categorical(probs)
         action = dist.sample()
@@ -87,8 +89,8 @@ def compute_advantages_and_returns(rewards, values, dones, gamma=0.99, n_steps=5
 #     return torch.FloatTensor(returns)
 
 def run_ppo_with_net(seed=0):
-    actor = Actor(state_dim, action_dim, hidden_dim)
-    critic = Critic(state_dim, hidden_dim)
+    actor = Actor(state_dim, action_dim, hidden_dim).to(device)
+    critic = Critic(state_dim, hidden_dim).to(device)
     optimizer_actor = optim.Adam(actor.parameters(), lr=lr_actor)
     optimizer_critic = optim.Adam(critic.parameters(), lr=lr_critic)
 
@@ -120,7 +122,7 @@ def run_ppo_with_net(seed=0):
                 eval_state, _ = env.reset(seed=seed)
                 done_eval = False
                 while not done_eval:
-                    eval_tensor = torch.tensor(eval_state, dtype=torch.float32).unsqueeze(0)
+                    eval_tensor = torch.tensor(eval_state, dtype=torch.float32).unsqueeze(0).to(device)
                     with torch.no_grad():
                         probs = actor(eval_tensor)
                     action_eval = torch.argmax(probs, dim=-1).item()
@@ -134,17 +136,19 @@ def run_ppo_with_net(seed=0):
         
 
         states, rewards, log_probs_old, actions, dones = zip(*episode_data)
-        states = torch.FloatTensor(np.array(states))  # Ensure states are on the correct device
+        states = torch.FloatTensor(np.array(states)).to(device)  # Ensure states are on the correct device
         rewards = np.array(rewards)
         dones = np.array(dones)
-        actions = torch.tensor(actions, dtype=torch.int64)
-        states_tensor = torch.FloatTensor(np.array(states))
+        actions = torch.tensor(actions, dtype=torch.int64).to(device)
+        states_tensor = states
         with torch.no_grad():
-            values = critic(states_tensor).squeeze().numpy()
+            values = critic(states_tensor).squeeze().cpu().numpy()
         advantages, returns = compute_advantages_and_returns(rewards, values, dones, gamma)
+        advantages = advantages.to(device)
+        returns = returns.to(device)
 
         # advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        log_probs_old_tensor = torch.stack(log_probs_old).detach()
+        log_probs_old_tensor = torch.stack(log_probs_old).detach().to(device)
         dataset_size = len(states)
         for _ in range(K_epoch):
             indices = np.arange(dataset_size)
@@ -165,9 +169,9 @@ def run_ppo_with_net(seed=0):
                 mb_ratio = torch.exp(mb_log_probs - mb_log_probs_old)
                 mb_policy_loss = -(mb_ratio * mb_advantages).mean()
             
-                with torch.no_grad():
-                    old_dist = torch.distributions.Categorical(probs=mb_probs.detach())
-                    kl_div = torch.distributions.kl.kl_divergence(old_dist, mb_dist).mean()
+                # with torch.no_grad():
+                old_dist = torch.distributions.Categorical(probs=mb_probs.detach())
+                kl_div = torch.distributions.kl.kl_divergence(old_dist, mb_dist).mean()
                 mb_policy_loss += beta * kl_div
                 # mb_entropy = mb_dist.entropy().mean()
                 # mb_policy_loss = mb_policy_loss - 0.01 * mb_entropy

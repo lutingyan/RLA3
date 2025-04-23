@@ -150,9 +150,9 @@ def run_ppo_with_net(seed=0):
                 mb_ratio = torch.exp(mb_log_probs - mb_log_probs_old)
                 mb_policy_loss = -(mb_ratio * mb_advantages).mean()
             
-                with torch.no_grad():
-                    old_dist = torch.distributions.Categorical(probs=mb_probs.detach())
-                    kl_div = torch.distributions.kl.kl_divergence(old_dist, mb_dist).mean()
+                old_probs = mb_probs.detach()
+                old_dist = torch.distributions.Categorical(probs=old_probs)
+                kl_div = torch.distributions.kl.kl_divergence(old_dist, mb_dist).mean()
                 mb_policy_loss += beta * kl_div
                 # mb_entropy = mb_dist.entropy().mean()
                 # mb_policy_loss = mb_policy_loss - 0.01 * mb_entropy
